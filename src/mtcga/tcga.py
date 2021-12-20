@@ -10,8 +10,11 @@ import pandas as pd
 import pypipegraph as ppg
 import requests
 import json
+import os
 import subprocess
 import numpy as np
+import tempfile
+import zipfile
 
 __author__ = "Marco Mernberger"
 __copyright__ = "Copyright (c) 2020 Marco Mernberger"
@@ -25,6 +28,8 @@ class TCGA:
         project_ids: List[str] = ["TCGA-BRCA"],
         data_types: List[str] = ["htseq_counts", "maf"],
         sample_types: List[str] = ["primary tumor"],
+        client_path: Path = Path("/project/cache/gdc_client"),
+        client_file: str = "gdc-client_v1.6.0_Ubuntu_x64-py3.7_0.zip",
     ) -> None:
         """
         Helper class to donwload and filter the TCGA files that we need.
@@ -44,12 +49,56 @@ class TCGA:
         self.file_endpt = "https://api.gdc.cancer.gov/files/"
         self.cases_endpt = "https://api.gdc.cancer.gov/cases"
         self.projects_endpt = "https://api.gdc.cancer.gov/projects"
-        self.gdc_client_command = ["/project/incoming/gdc-client"]
-        self.file_dir = Path("/project/incoming/tcga")
+        self.client_path = client_path
+        self.client_path.mkdir(parents=True, exist_ok=True)
+        self.gdc_client_command = str(client_path / "gdc-client")
+        self.file_dir = Path("/machine/ffs/datasets/tcga")  #  "/project/incoming/tcga"
         self.cache_dir = Path("/project/cache/tcga") / self.name
         self.sample_types = sample_types
         self.data_types = data_types
         self.project_ids = project_ids
+        self.client_file = client_file
+
+    def download_client(self):
+        """
+        Downloads the GDC client to the client path.
+        """
+        url = f"https://gdc.cancer.gov/files/public/file/{self.client_file}"
+        r = requests.get(url)
+        f = tempfile.TemporaryFile()
+        f.write(r.content)
+        with zipfile.ZipFile(f, "r") as zip_ref:
+            zip_ref.extractall(self.client_path)
+        os.chmod(self.gdc_client_command, 0o770)
+
+    def ensure_client(self) -> FileGeneratingJob:
+        """
+        Generates a FileGeneratingJob that downloads the gdc client.
+
+        Dependency for the actual file download.
+
+        Returns
+        -------
+        FileGeneratingJob
+            Job to download GDC client.
+        """
+        self.client_path.mkdir(parents=True, exist_ok=True)
+        outfile = self.client_path / "gdc-client"
+        return ppg.FileGeneratingJob(outfile, self.download_client)
+
+    def get_dependencies(self) -> List[Job]:
+        """
+        List of dependency jobs.
+
+        Returns
+        -------
+        List[Job]
+            List of dependency jobs.
+        """
+        return [
+            self.ensure_client(),
+            ppg.FunctionInvariant(self.name + "_ensure_client", self.ensure_client),
+        ]
 
     def load(self) -> Job:
         """
@@ -65,6 +114,7 @@ class TCGA:
         Job
             CachedDataLoadingJob that adds attributes to the class instance.
         """
+
         def __calc():
             """reads cached DataFrames after they are created."""
             dictionary_with_attributes = {}
@@ -103,6 +153,7 @@ class TCGA:
             ppg.CachedDataLoadingJob(
                 self.cache_dir / (self.name + "_load"), __calc, __load
             )
+            .depends_on(self.get_dependencies())
             .depends_on(jobs)
             .depends_on(
                 [
@@ -148,12 +199,16 @@ class TCGA:
             df = request_function()
             df.to_csv(outfile, sep="\t", index=False)
 
-        return ppg.FileGeneratingJob(outfile, __dump).depends_on(
-            [
-                ppg.FunctionInvariant(self.name + "_get_filters", self._get_filter),
-                ppg.FunctionInvariant(self.name + "_get_files", self.get_files),
-                ppg.FunctionInvariant(self.name + "_get_cases", self.get_cases),
-            ]
+        return (
+            ppg.FileGeneratingJob(outfile, __dump)
+            .depends_on(
+                [
+                    ppg.FunctionInvariant(self.name + "_get_filters", self._get_filter),
+                    ppg.FunctionInvariant(self.name + "_get_files", self.get_files),
+                    ppg.FunctionInvariant(self.name + "_get_cases", self.get_cases),
+                ]
+            )
+            .depends_on(self.get_dependencies())
         )
 
     def _get_filter(
@@ -402,6 +457,7 @@ class TCGA:
         Job
             Job that loads a DataFrame with all usable cases.
         """
+
         def get_cases_to_use():
             # intersect cases
             attr_name = f"df_{self.name}_{self.data_types[0]}_cases"
@@ -416,7 +472,10 @@ class TCGA:
 
         return [
             ppg.CachedAttributeLoadingJob(
-                f"{self.name}_df_cases", self, "df_cases", get_cases_to_use
+                self.cache_dir / f"{self.name}_df_cases",
+                self,
+                "df_cases",
+                get_cases_to_use,
             ).depends_on(self.load()),
             self.write_df_from_request("df_cases", get_cases_to_use).depends_on(
                 self.load()
@@ -435,10 +494,10 @@ class TCGA:
         for project_id in self.project_ids:
             for data_type in self.data_types:
                 manifest = (
-                    self.file_dir / project_id.lower() / data_type / "manifest.txt"
+                    self.cache_dir / project_id.lower() / data_type / "manifest.txt"
                 )
                 manifest_missing = (
-                    self.file_dir
+                    self.cache_dir
                     / project_id.lower()
                     / data_type
                     / "manifest_missing.txt"
@@ -460,14 +519,15 @@ class TCGA:
             for project_id in self.project_ids:
                 for data_type in self.data_types:
                     manifest = (
-                        self.file_dir / project_id.lower() / data_type / "manifest.txt"
+                        self.cache_dir / project_id.lower() / data_type / "manifest.txt"
                     )
                     manifest_missing = (
-                        self.file_dir
+                        self.cache_dir
                         / project_id.lower()
                         / data_type
                         / "manifest_missing.txt"
                     )
+                    manifest.parent.mkdir(exist_ok=True, parents=True)
                     output_folder = (
                         self.file_dir / project_id.lower() / data_type / "files"
                     )
@@ -496,6 +556,7 @@ class TCGA:
 
         return (
             ppg.MultiFileGeneratingJob(output_files, __write)
+            .depends_on(self.get_dependencies())
             .depends_on(self.load())
             .depends_on(self.intersect_queries())
             .depends_on(jobs)
@@ -549,22 +610,23 @@ class TCGA:
         outfiles = []
         for project_id in self.project_ids:
             for data_type in self.data_types:
-                stdout = self.file_dir / project_id.lower() / data_type / "stdout.txt"
+                stdout = (
+                    self.cache_dir
+                    / project_id.lower()
+                    / data_type
+                    / f"stdout.txt"
+                )
+                stdout.parent.mkdir(exist_ok=True, parents=True)
                 outfiles.append(stdout)
 
         def __download():
-            for project_id in self.project_ids:
-                for data_type in self.data_types:
-                    manifest = (
-                        self.file_dir
-                        / project_id.lower()
-                        / data_type
-                        / "manifest_missing.txt"
-                    )
-                    self.download(manifest)
+            for outfile in outfiles:
+                manifest = outfile.parent / "manifest_missing.txt"
+                self.download(manifest)
 
         return (
             ppg.MultiFileGeneratingJob(outfiles, __download)
+            .depends_on(self.get_dependencies())
             .depends_on(self.write_manifest)
             .depends_on(self.load())
             .depends_on(self.intersect_queries())
@@ -579,15 +641,17 @@ class TCGA:
         manifest : Path
             Manifest file.
         """
-        output_folder = manifest.parent / "files"
+        output_folder = manifest.parent
         stdout = manifest.parent / "stdout.txt"
-        cmd = self.gdc_client_command + [
+        cmd = [self.gdc_client_command] + [
             "download",
             "-m",
             str(manifest.absolute()),
             "-d",
             str(output_folder.absolute()),
         ]
+        print(" ".join(cmd))
+        raise ValueError()
         with stdout.open("w") as outp:
             subprocess.check_call(cmd, stdout=outp)
 
@@ -630,6 +694,7 @@ class TCGA:
 
         return (
             ppg.MultiFileGeneratingJob(outfiles, __write)
+            .depends_on(self.get_dependencies())
             .depends_on(self.load())
             .depends_on(self.intersect_queries())
             .depends_on(self.fetch_files())
@@ -705,6 +770,7 @@ class TCGA:
 
         return (
             ppg.MultiFileGeneratingJob(outfiles, __write)
+            .depends_on(self.get_dependencies())
             .depends_on(self.load())
             .depends_on(self.intersect_queries())
             .depends_on(self.write_htseq_meta())
@@ -753,8 +819,9 @@ class TCGA:
 
         return (
             ppg.FileGeneratingJob(outfile, __write)
+            .depends_on(self.get_dependencies())
             .depends_on(self.load())
             .depends_on(self.intersect_queries())
-            .depends_on(self.write_htseq_meta())
+            #            .depends_on(self.write_htseq_meta())
             .depends_on(self.fetch_files())
         )
