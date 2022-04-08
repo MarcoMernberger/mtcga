@@ -4,7 +4,7 @@
 """tcga.py: Contains the TCGA class that offers some functionality for accessing
 the GDC protal though the GDC API."""
 from pathlib import Path
-from typing import Callable, List
+from typing import Callable, List, Optional, Dict
 from pypipegraph import Job, FileGeneratingJob
 import pandas as pd
 import pypipegraph as ppg
@@ -27,7 +27,7 @@ class TCGA:
         name: str,
         project_ids: List[str] = ["TCGA-BRCA"],
         data_types: List[str] = ["htseq_counts", "maf"],
-        sample_types: List[str] = ["primary tumor"],
+        sample_types: Optional[List[str]] = None,
         client_path: Path = Path("/project/cache/gdc_client"),
         client_file: str = "gdc-client_v1.6.0_Ubuntu_x64-py3.7_0.zip",
     ) -> None:
@@ -42,7 +42,7 @@ class TCGA:
             List of poject ids, by default ["TCGA-BRCA"].
         datatypes : List[str], optional
             list of file types to select, by default ["htseq_counts", "maf"].
-        sample_types : List[str], optional
+        sample_types : Optional[List[str]], optional, by default None.
             List of acceptable tissue types, by default ["primary tumor"].
         """
         self.name = name
@@ -52,9 +52,11 @@ class TCGA:
         self.client_path = client_path
         self.client_path.mkdir(parents=True, exist_ok=True)
         self.gdc_client_command = str(client_path / "gdc-client")
-        self.file_dir = Path("/machine/ffs/datasets/tcga")  #  "/project/incoming/tcga"
+        self.file_dir = Path("/machine/ffs/datasets/tcga")  # "/project/incoming/tcga"
         self.cache_dir = Path("/project/cache/tcga") / self.name
         self.sample_types = sample_types
+        if sample_types is None:
+            self.sample_types = []
         self.data_types = data_types
         self.project_ids = project_ids
         self.client_file = client_file
@@ -196,7 +198,13 @@ class TCGA:
         outfile.parent.mkdir(parents=True, exist_ok=True)
 
         def __dump():
-            df = request_function()
+            result = request_function()
+            if type(result) == tuple:
+                df = result[0]
+                with outfile.with_suffix(".log").open("w") as op:
+                    op.write(result[1])
+            else:
+                df = result
             df.to_csv(outfile, sep="\t", index=False)
 
         return (
@@ -212,8 +220,8 @@ class TCGA:
         )
 
     def _get_filter(
-        self, project_ids: List[str], datatype: str, sample_types: List[str]
-    ) -> str:
+        self, project_ids: List[str], datatype: str, sample_types: List[str] = []
+    ) -> Dict[str, object]:
         """
         Returns a filter function for querying the gdc data protal using the GDC API.
 
@@ -228,28 +236,31 @@ class TCGA:
             List of poject ids, e.g. ["TCGA-BRCA"].
         datatype : str
             list of file types to select, e.g. "htseq_counts".
-        sample_types : List[str]
+        sample_types : List[str], by default [].
             List of acceptable tissue types, e.g. ["primary tumor"].
 
         Returns
         -------
-        str
-            json-formatted str from filter dict.
+        Dict[str, Object]
+            A json dict.
 
         Raises
         ------
         ValueError
             "If the file type to filter for is not understood."
         """
-        contents = [
-            {
-                "op": "=",
-                "content": {
-                    "field": "cases.samples.sample_type",
-                    "value": sample_types,
-                },
-            }
-        ]
+        contents = []
+        if len(sample_types) > 0:
+            contents.append(
+                {
+                    "op": "=",
+                    "content": {
+                        "field": "cases.samples.sample_type",
+                        "value": sample_types,
+                    },
+                }
+
+            )
         if len(project_ids) > 0:
             contents.append(
                 {
@@ -305,7 +316,7 @@ class TCGA:
         else:
             raise ValueError(f"Don't know what to do with this datatype: {datatype}.")
         filters = {"op": "and", "content": contents}
-        return json.dumps(filters)
+        return filters
 
     def get_cases(
         self, project_ids: List[str], datatype: str, sample_types: List[str],
@@ -344,19 +355,25 @@ class TCGA:
             params = {
                 "filters": _filter,
                 "fields": ",".join(fields),
-                "format": "TSV",
-                "size": 100000,
+                "format": "JSON",
             }
-            response = requests.get(self.cases_endpt, params=params)
-            result = response.content.decode().strip().split("\n")
-            columns = result[0].replace("\r", "").split("\t")
-            data = [row.replace("\r", "").split("\t") for row in result[1:]]
-            df = pd.DataFrame(data, columns=columns)
-            print(df.head())
-            df.index = df.case_id
-            return df
+            df = self.fetch_df_from_endpoint(self.cases_endpt, params)
+            return df, str(params)
 
         return call
+
+    def fetch_df_from_endpoint(self, endpoint: str, params: dict):
+        p = params.copy()
+        params["filters"] = json.dumps(params["filters"])
+        response = requests.get(endpoint, params=params)
+        result_json = response.json()
+        df = pd.read_json(json.dumps(result_json["data"]["hits"]))
+        if df.empty:
+            print("Paremeters:\n")
+            print(json.dumps(p, indent=2))
+            raise ValueError("The parameter provided did not reeeetieve any entities from the endpoint ({endpoint})")
+        df = df.set_index("id")
+        return df
 
     def get_files(
         self, project_ids: List[str], datatype: str, sample_types: List[str],
@@ -414,31 +431,11 @@ class TCGA:
             params = {
                 "filters": _filter,
                 "fields": ",".join(fields),
-                "format": "TSV",
-                "size": 100000,
+                "format": "JSON",
             }
-            response = requests.get(self.file_endpt, params=params)
-            result = response.content.decode().strip().split("\n")
-            columns = result[0].replace("\r", "").split("\t")
-            data = [row.replace("\r", "").split("\t") for row in result[1:]]
-            df = pd.DataFrame(data, columns=columns)
+            df = self.fetch_df_from_endpoint(self.file_endpt, params)
             df = df[df["access"] == "open"]
-            no_cases = np.ones(len(df))
-            drop_columns = []
-            if "cases.1.case_id" in df.columns:
-                for col in df.columns:
-                    if col.startswith("cases."):
-                        if col[6] != "0":
-                            drop_columns.append(col)
-                            if "case_id" in col:
-                                no_cases += ~(df[col] == "")
-            else:
-                df["case_id"] = df["cases.0.case_id"]
-                df.index = df["case_id"]
-            columns = [col for col in df.columns if col not in drop_columns]
-            df = df[columns]
-            df["no_cases"] = no_cases
-            return df
+            return df, str(params)
 
         return call
 
@@ -477,7 +474,7 @@ class TCGA:
                 "df_cases",
                 get_cases_to_use,
             ).depends_on(self.load()),
-            self.write_df_from_request("df_cases", get_cases_to_use).depends_on(
+            self.write_df_from_request("df_cases_to_use", get_cases_to_use).depends_on(
                 self.load()
             ),
         ]
@@ -533,6 +530,9 @@ class TCGA:
                     )
                     output_folder.mkdir(parents=True, exist_ok=True)
                     df_files = getattr(self, f"df_{self.name}_{data_type}_files")
+                    for c in df_files.columns:
+                        print(c)
+                        
                     df_files = df_files[
                         df_files["cases.0.project.project_id"] == project_id
                     ]
@@ -607,7 +607,7 @@ class TCGA:
         ppg.job
             MultiFileGeneratingJob that starts the GDC downlöoad client.
         """
-        outfiles = []
+        outfiles_and_destinations = {}
         for project_id in self.project_ids:
             for data_type in self.data_types:
                 stdout = (
@@ -617,22 +617,25 @@ class TCGA:
                     / f"stdout.txt"
                 )
                 stdout.parent.mkdir(exist_ok=True, parents=True)
-                outfiles.append(stdout)
+                output_folder = (
+                    self.file_dir / project_id.lower() / data_type / "files"
+                    )
+                outfiles_and_destinations[stdout] = output_folder
 
         def __download():
-            for outfile in outfiles:
+            for outfile in outfiles_and_destinations:
                 manifest = outfile.parent / "manifest_missing.txt"
-                self.download(manifest)
+                self.download(manifest, outfiles_and_destinations[outfile])
 
         return (
-            ppg.MultiFileGeneratingJob(outfiles, __download)
+            ppg.MultiFileGeneratingJob(list(outfiles_and_destinations.keys()), __download)
             .depends_on(self.get_dependencies())
             .depends_on(self.write_manifest)
             .depends_on(self.load())
             .depends_on(self.intersect_queries())
         )
 
-    def download(self, manifest: Path):
+    def download(self, manifest: Path, outfolder: Path = None):
         """
         Starts the gdc client to download the files from a manifest.
 
@@ -641,7 +644,10 @@ class TCGA:
         manifest : Path
             Manifest file.
         """
-        output_folder = manifest.parent
+        if outfolder is not None:
+            output_folder = outfolder
+        else:
+            output_folder = manifest.parent
         stdout = manifest.parent / "stdout.txt"
         cmd = [self.gdc_client_command] + [
             "download",
@@ -650,10 +656,12 @@ class TCGA:
             "-d",
             str(output_folder.absolute()),
         ]
-        print(" ".join(cmd))
-        raise ValueError()
-        with stdout.open("w") as outp:
-            subprocess.check_call(cmd, stdout=outp)
+        try:
+            with stdout.open("w") as outp:
+                subprocess.check_call(cmd, stdout=outp)
+        except subprocess.CalledProcessError:
+            print(" ".join(cmd))
+            raise ValueError()
 
     def write_htseq_meta(self) -> ppg.FileGeneratingJob:
         """
@@ -736,7 +744,6 @@ class TCGA:
                     )
                     df_meta = pd.read_csv(str(inpath), sep="\t")
                     dfs = []
-
                     for _, row in df_meta.iterrows():
                         case_id = row["case_id"]
                         project_id = row["project_id"]
@@ -793,6 +800,7 @@ class TCGA:
         def __write():
             df_maf_files = getattr(self, f"df_{self.name}_maf_files")
             dfs = []
+            print(len(self.df_cases["case_id"].unique()))
             for _, row in df_maf_files.iterrows():
                 project_id = row["cases.0.project.project_id"]
                 file_id = row["file_id"]
@@ -805,16 +813,21 @@ class TCGA:
                     / file_id
                     / file_name
                 )
+                print(path2file)
                 caller = path2file.name.split(".")[2]
                 df_caller = pd.read_csv(
                     path2file, compression="gzip", sep="\t", comment="#"
                 )
+                print(len(df_caller["case_id"].unique()))
                 df_caller["Caller"] = [caller] * len(df_caller)
-                df_caller = df_caller[
-                    df_caller["case_id"].isin(self.df_cases["case_id"])
-                ]
+                #df_caller = df_caller[
+                #    df_caller["case_id"].isin(self.df_cases["case_id"])
+                #]
                 dfs.append(df_caller)
             df = pd.concat(dfs)
+            print(len(df["case_id"].unique()))
+            
+            raise ValueError()
             df.to_csv(str(outfile), sep="\t", index=False)
 
         return (
